@@ -1,0 +1,6 @@
+toys/
+nn_inputs/
+papers/
+veldata/
+.ipynb_checkpoints/
+graph_nn_basics_py3_save.ipynb
