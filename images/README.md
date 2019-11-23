@@ -1,0 +1,1 @@
+inp.png, lbl.png, and out.png are NN input, label and NN output graphs. The out.png is the NN's prediction of the label graph, which was simulated one timestep after the input graph. It did a great job! :D
