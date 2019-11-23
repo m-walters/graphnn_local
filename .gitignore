@@ -4,3 +4,4 @@ papers/
 veldata/
 .ipynb_checkpoints/
 graph_nn_basics_py3_save.ipynb
+ckpts/
