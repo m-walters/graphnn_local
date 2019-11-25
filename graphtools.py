@@ -1,38 +1,16 @@
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Circle, Rectangle
 import csv
-import sys
-import time
 import pandas as pd
-from tqdm import tqdm
-
-
-import mpi4py
-mpi4py.rc.initialize = False
-from mpi4py import MPI
-import h5py
-
-MPI.Init()
-assert MPI.Is_initialized()
-
-
-# Initialize MPI actors
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
 
 long2km = 1/0.011741652782473
 lat2km = 1/0.008994627867046
-
-def finalize_mpi():
-    MPI.Finalize()
-    return
-
-def stdout(s, rank=None):
-    if not rank:
-        sys.stdout.write(str(s)+'\n')
-    elif rank==0:
-        sys.stdout.write(str(s)+'\n')
-    else: return
+# Fifth ring
+# xmin = 116.1904 * long2km
+# xmax = 116.583642 * long2km
+# ymin = 39.758029 * lat2km
+# ymax = 40.04453 * lat2km
 
 def dist_from(ref,rs):
     # ref is 1x2 ndarray
@@ -49,7 +27,8 @@ def df_empty(columns, dtypes, index=None):
         df[c] = pd.Series(dtype=d)
     return df
 
-def nodes4vel(p, nodes_df, within):
+def nodes_nearby(p, nodes_df, within):
+    # Returns closest node index and its row within distance "within"
     nodes_df['z'] = dist_from(p, np.asarray(nodes_df['coords_km'].tolist()))
     nodes_df.sort_values(by=['z'],inplace=True)
     nodes_return, d2n_return = [],[]
@@ -71,11 +50,7 @@ def get_edge_angle(nodedf,i,j):
     return np.angle(z)   
     
     
-def build_vdf(data_np, nodedf, days=[], tgs=[], nTG=None, nvel=None, node4vel_range=1.0, **kwargs):
-    #
-    # Let's have graphsnapper call this function from each processor
-    # Pass build_vdf the appropriate numpy data slice to be processed each call
-    #
+def get_veldf(fname, nodedf, days=[], tgs=[], nTG=None, nvel=None):
     if len(days) == 0:
         # Grab all days
         days = np.arange(7)
@@ -84,28 +59,27 @@ def build_vdf(data_np, nodedf, days=[], tgs=[], nTG=None, nvel=None, node4vel_ra
             print("If no tgs provided, specify nTG. Exiting")
             return
         tgs = np.arange(nTG)
-
+    vfile = open(fname,'r')
     vdf = pd.DataFrame(columns=["day","tg","x_km","y_km","vx","vy","v","nodeID","dist2node","angle"])
-
     vi = 0
-    #for v in tqdm(vfile.readlines(), disable=kwargs["disable_tqdm"]):
-    for row in tqdm(data_np, disable=kwargs["disable_tqdm"]):
-        day = int(row[0])
-        tg = int(row[1])
+    for v in vfile.readlines():
+        w = v.split()
+        day = int(w[0])
+        tg = int(w[1])
         if day not in days: continue
         if tg not in tgs: continue
         # Apparently appending a list of dict
         # preserves the datatype
         # See: https://stackoverflow.com/questions/21281463/appending-to-a-dataframe-converts-dtypes
-        x_km, y_km = float(row[2]), float(row[3])
-        nbrnodes, d2ns = nodes4vel([x_km, y_km], nodedf, within=node4vel_range)
+        x_km, y_km = float(w[2]), float(w[3])
+        nbrnodes, d2ns = nodes_nearby([x_km, y_km], nodedf, within=1.0)
         if len(nbrnodes) == 0:
             # point is too far from any nodes for 
             # this to be accurate data
             continue
         
         # Get vel angle in [-pi,pi] format
-        vx, vy = float(row[4]), float(row[5])
+        vx, vy = float(w[4]), float(w[5])
         z = np.complex(vx,vy)
         angle = np.angle(z)
 
@@ -118,54 +92,52 @@ def build_vdf(data_np, nodedf, days=[], tgs=[], nTG=None, nvel=None, node4vel_ra
                 "y_km": y_km,
                 "vx": vx,
                 "vy": vy,
-                "v": float(row[6]),
+                "v": float(w[6]),
                 "nodeID": nbrnodes[inbr],
                 "dist2node": d2ns[inbr],
                 "angle": angle
             }], ignore_index=True)
 
-        vi+=1
+            vi+=1
+            if nvel and vi >= nvel: break
         if nvel and vi >= nvel: break
-
-    vdf.drop_duplicates(inplace=True)
+    vfile.close()
+    
     return vdf
 
 
-def generate_nodes(fname="./hwy_pts.csv",
+def generate_nodes(fname="./hwy_pts.csv", 
                    mindist=0.05, 
                    region=None, 
                    **kwargs):
     # region is scope for domain, [xmin,xmax,ymin,ymax] in GSI coordinates
     # use kwargs for passing kws to generate_edges
-    # mindist to reduce redundant nodes
+    # mindist between nodes to reduce redundancies
     # We can optimize node removal during the edge finding process
+    
     nodedict = {}
     nodeidx = 0
     with open(fname, newline='') as hwyfile:
         reader = csv.reader(hwyfile)
         next(reader, None) # skip header
-        stdout("Creating nodes...", rank)
-        for l in tqdm(reader, disable=kwargs["disable_tqdm"]):
+        for l in reader:
             x,y = float(l[0]), float(l[1])
             if region:
                 if x<region[0] or x>region[1] or y<region[2] or y>region[3]:
                     continue
             nodedict.update({nodeidx:{"coords":[float(l[0]),float(l[1])]}})
-            nodedict[nodeidx].update({"nbrs": []})
+            # Initialize edge dict inside nodedict
+            nodedict[nodeidx].update({"nbrs":[]})
             nodeidx+=1
 
     df = pd.DataFrame(nodedict).T
-    df["coords_km"] = df.apply(lambda x: coord2km(x["coords"]), axis=1)
+    df["coords_km"] = df.apply(lambda x: coord2km(x['coords']), axis=1)
     
-    # Link neighbours and drop redundant nodes
-    stdout("Linking neighbours...", rank)
-    tn1 = time.time()
-    link_neighbours(df,mindist=mindist, **kwargs)
+    # Link neighbours, and drop nodes
+    link_neighbours(df, mindist, **kwargs)
     # Reorder by index
     df.sort_index(inplace=True)
-    tn2 = time.time()
-    stdout("Linked neighbours in "+str(tn2-tn1)+" seconds",rank)
-
+    
     # Let's re-index the nodes
     rekey = {}
     newkey = 0
@@ -182,17 +154,9 @@ def generate_nodes(fname="./hwy_pts.csv",
             newnbrs.append(rekey[nbr])
         df.at[key,'nbrs'] = list(newnbrs)
 
-    # Edges
+    # Generate edges
     edges = pd.DataFrame(columns=["sender","receiver","angle"])
-    stdout("Generating edges...", rank)
-    nnode = len(df.index)
-    nnode_per = nnode//size
-    remainder = nnode%size
-    nstart, nend = rank*nnode_per, (rank+1)*nnode_per
-    if rank == (size-1): nend += remainder
-        
-    # First we do out initial edge making with the maxnbr restriction
-    for key,node in tqdm(df[nstart:nend].iterrows(), disable=kwargs["disable_tqdm"]):
+    for key,node in df.iterrows():
         for nbr in node['nbrs']:
             # Get theta in [-pi,pi] radians
             theta = get_edge_angle(df,key,nbr)
@@ -202,157 +166,50 @@ def generate_nodes(fname="./hwy_pts.csv",
                 "angle": theta
             }], ignore_index=True)
 
-    stdout("Finished the initial edgemaking limited by maxnbr "+str(kwargs["maxnbr"]),rank)
-    # Combine edge dfs
-    edges_dflist = comm.gather(edges,root=0)
-    if rank==0:
-        edges = edges.append(edges_dflist[1:], ignore_index=True)
-    del edges_dflist
-    edges.drop_duplicates(inplace=True)
-    edges = comm.bcast(edges,root=0)
-
-    stdout("Patching up the one-way edges to create two-ways...",rank)
-    # Now we patch up the one-way connections that were missed from the maxnbr restriction
-    # The edges df is unique to each process, so iterate the whole lot
-    for idx,edge in tqdm(edges.iterrows(), disable=kwargs["disable_tqdm"]):
-        # Grab a sender and see if it appears as a receiver to each of its
-        # own receivers. If not, add it
-        s,r,th = edge['sender'], edge['receiver'], edge['angle']
-        r_receivers = edges.loc[edges['sender']==r, 'receiver'].values
-        if s not in r_receivers:
-            th_ = (th+np.pi) if th<0 else (th-np.pi)
-            edges = edges.append({'sender': r, 'receiver': s, 'angle': th_}, ignore_index=True)
-        
     return df, edges
 
 
-def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8, **kwargs):
-    '''
-    This function has two main stages
-    First it finds which nodes are too close together (the nearnbrs loop)
-    It finds these and compiles the list using gather and then removes nodes
-    Then it does the same loop again but for the real nbrs up to maxnbr
-    '''
+def link_neighbours(df, mindist=0.05, maxdist=1.0, maxnbr=8):
     # Create km coords
     if "coords_km" not in df.columns:
         df["coords_km"] = df.apply(lambda x: coord2km(x['coords']), axis=1)
 
-    # Create edgeref column
+    # Create nbr column
     if "nbrs" not in df.columns:
-        df["nbrs"] = [[] for _ in df.index]
+        df["nbrs"] = ""
 
-    # Create nearnbrs column for redundancy removal
-    # Also, by adding how many neighbours we can
-    # sort by num nearnbrs to optimize which nodes
-    # get deleted. A node with many neighbours should
-    # kill the neighbours because this node is a good approx
-    # for all of them
-    df["nearnbrs"] = [[] for _ in df.index]
-    df["n_nearnbrs"] = 0
-    df['z'] = 0.
-
-    nnode = len(df.index)
-    nnode_per = nnode//size
-    remainder = nnode%size
-    nstart, nend = rank*nnode_per, (rank+1)*nnode_per
-    if rank == (size-1):
-        nend += remainder
-    for idx,node in df[nstart:nend].iterrows():
+    df['z'] = ""
+    droplist = []
+    for idx,node in df.iterrows():
+        if idx in droplist:
+            continue
         df['z'] = dist_from(node['coords_km'], np.asarray(df['coords_km'].tolist()))
         df.sort_values(by=['z'], inplace=True)
 
-        nearnbrs = []
+        # Erase nodes that are too close
         for j in df.index[1:]:
             if df.loc[j]['z'] < mindist:
-                nearnbrs.append(j)
+                droplist.append(j)
             else:
                 break
-        n=len(nearnbrs)
-        if n > 0:
-            df.at[idx,"nearnbrs"] = list(nearnbrs)
-            df.at[idx,"n_nearnbrs"] = n
 
-
-    # Each node has a nearnbr list
-    # Sort by n_nearnbr and remove nodes
-    # You need to combine all the nearnbr lists
-    # and then broadcast the compiled list
-    # then each processor delete the rows in their (to-be-)identical dfs
-    df.sort_index(inplace=True)
-    g_nbrlist = comm.gather(df[["nearnbrs","n_nearnbrs"]],root=0)
-    df_ = None
-    if rank==0:
-        df_ = g_nbrlist[0].copy()
-        for d in g_nbrlist[1:]:
-            # Assert there is no overlap
-            assert df_[d['n_nearnbrs']>0].sum(axis=0)['n_nearnbrs'] == 0
-            df_.loc[d["n_nearnbrs"]>0,['nearnbrs','n_nearnbrs']] = d[['nearnbrs','n_nearnbrs']]
-        # Assert we have no nans
-        assert df_.isna().sum().sum() == 0
-    df_ = comm.bcast(df_,root=0)
-    df.loc[df_["n_nearnbrs"]>0,['nearnbrs','n_nearnbrs']] = df_[['nearnbrs','n_nearnbrs']]
-
-    # Want to find nodes with the most neighbours and elimate said nbrs
-    # (If only it were that easy)
-    df.sort_values(by=["n_nearnbrs"],inplace=True, ascending=False)
-
-    # Remove redundant neighbours
-    stdout("Deleting nearnbrs...",rank)
-    pre_nnode = nnode
-    for lbl,row in df.iterrows():
-        if row["n_nearnbrs"] < 1: break
-        if row["n_nearnbrs"] == 1:
-            nb = int(row["nearnbrs"][0])
-            if nb in df.index:
-                removes = nb
-            else:
-                removes = []
-        else:
-            removes = list(set(list(row["nearnbrs"])) & set(df.index))
-        df.drop(removes, inplace=True)
-    post_nnode = len(df.index)
-    stdout("Removed "+str(pre_nnode-post_nnode)+" redundant nbrs",rank)
-
-    df.drop(columns=['n_nearnbrs','nearnbrs'],inplace=True)
-    stdout("Connecting final nbrs...", rank)
-    nnode = len(df.index)
-    nnode_per = nnode//size
-    remainder = nnode%size
-    nstart, nend = rank*nnode_per, (rank+1)*nnode_per
-    if rank == (size-1):
-        nend += remainder
-    # Fill the 'nbrs' col of df 
-    df['n_nbrs'] = 0
-    for idx,node in tqdm(df[nstart:nend].iterrows(), disable=kwargs["disable_tqdm"]):
+    df.drop(droplist,inplace=True)
+    for idx,node in df.iterrows():
         # Populate 'z' column
         df['z'] = dist_from(node['coords_km'], np.asarray(df['coords_km'].tolist()))
         df.sort_values(by=['z'],inplace=True)
         nbrs = []
         n_nbr = 0
         for j in df.index[1:]:
-            if df.loc[j,'z'] < maxdist:
+            if df.loc[j]['z'] < maxdist:
                 nbrs.append(j)
                 n_nbr+=1
             else: break
             if n_nbr == maxnbr: break
-        df.at[idx,"nbrs"] = list(nbrs)
-        df.at[idx,"n_nbrs"] = n_nbr
+        df.at[idx,"nbrs"] = nbrs
 
-    # Update eachother's nbr lists
-    g_nbrlist = comm.gather(df[["n_nbrs","nbrs"]],root=0)
-    df_ = None
-    if rank==0:
-        df_ = g_nbrlist[0].copy()
-        for d in g_nbrlist[1:]:
-            assert df_.loc[d['n_nbrs']>0].sum(axis=0)['n_nbrs'] == 0
-            df_.loc[d['n_nbrs']>0,['n_nbrs','nbrs']] = d[['n_nbrs','nbrs']]
-        # Assert we have no nans
-        assert df_.isna().sum().sum() == 0
-    df_ = comm.bcast(df_,root=0)
-    df.loc[df_["n_nbrs"]>0,['nbrs','n_nbrs']] = df_[['nbrs','n_nbrs']]
-
-    # Remove z and n_nbrs
-    df.drop(columns=['z','n_nbrs'],inplace=True)
+    # Remove z
+    df.drop(columns='z',inplace=True)    
     return
     
         

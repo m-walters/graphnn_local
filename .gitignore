@@ -5,3 +5,9 @@ veldata/
 .ipynb_checkpoints/
 graph_nn_basics_py3_save.ipynb
 ckpts/
+__pycache__/
+hwy_pts.csv
+tmp.py
+graphsnapper.ipynb
+graphsnapper_mpi.py
+graphtools_mpi.py
