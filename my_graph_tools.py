@@ -24,8 +24,8 @@ twopi = np.pi*2
 
 
 # Defaults for below were 2 and 16
-NUM_LAYERS = 3  # Hard-code number of layers in the edge/node/global models.
-LATENT_SIZE = 32  # Hard-code latent layer sizes for demos.
+NUM_LAYERS = 1  # Hard-code number of layers in the edge/node/global models.
+LATENT_SIZE = 16  # Hard-code latent layer sizes for demos.
 NTG = 144
 
 def make_mlp_model(Lsize=LATENT_SIZE,Nlayer=NUM_LAYERS):
@@ -49,8 +49,7 @@ def make_mlp_model(Lsize=LATENT_SIZE,Nlayer=NUM_LAYERS):
   ])
   """
   return snt.Sequential([
-      snt.nets.MLP([Lsize] * Nlayer, activate_final=True),
-      snt.LayerNorm()
+      snt.nets.MLP([Lsize] * Nlayer, activate_final=True)
   ])
 
 
@@ -75,8 +74,7 @@ class MLPGraphNetwork(snt.AbstractModule):
     super(MLPGraphNetwork, self).__init__(name=name)
     with self._enter_variable_scope():
         self._network = \
-            modules.GraphNetwork(
-                make_mlp_model, make_mlp_model, 
+            modules.GraphNetwork(make_mlp_model, make_mlp_model,
                 lambda:timecrement(NTG,disable=True),
                 global_block_opt={"use_edges":False,"use_nodes":False})
 
@@ -84,12 +82,50 @@ class MLPGraphNetwork(snt.AbstractModule):
     return self._network(inputs)
 
 
+def get_empty_graph(nodeshape,edgeshape,glblshape,senders,receivers):
+    dic = {
+        "globals": np.zeros(glblshape,dtype=np.float),
+        "nodes": np.zeros(nodeshape,dtype=np.float),
+        "edges": np.zeros(edgeshape,dtype=np.float),
+        "senders": senders,
+        "receivers": receivers
+    }
+    return utils_tf.data_dicts_to_graphs_tuple([dic])
+
+
+class GeoMLP(snt.AbstractModule):
+    """For extracting the geographic dependencies of each location"""
+    def __init__(self,init_graph,name="GeoMLP"):
+        super(GeoMLP, self).__init__(name=name)
+        nnode, nedge = init_graph.nodes.shape[0], init_graph.edges.shape[0]
+        nnode_ft, nedge_ft, nglbl_ft = 5,7,9
+        
+        with self._enter_variable_scope():
+            self.node_mlp = snt.nets.MLP([nnode_ft])
+            self.edge_mlp = snt.nets.MLP([nedge_ft])
+            self.glbl_mlp = snt.nets.MLP([nglbl_ft])
+            self.geograph = get_empty_graph((nnode,nnode_ft),
+                                            (nedge,nedge_ft),
+                                            (1,nglbl_ft),
+                                            init_graph.senders,
+                                            init_graph.receivers
+                                           )
+    
+    def _build(self, inputs):
+        self.geograph = self.geograph.replace(
+                    nodes=self.node_mlp(inputs.nodes),
+                    edges=self.edge_mlp(inputs.edges),
+                    globals=self.glbl_mlp(inputs.globals))
+        return self.geograph
+
+
+
 class EncodeProcessDecode(snt.AbstractModule):
     """Full encode-process-decode model.
 
     The model we explore includes three components:
     - An "Encoder" graph net, which independently encodes the edge, node, and
-      global attributes (does not compute relations etc.).
+      global attributes (does not compute relations etc.). Uses an MLP to expand.
     - A "Core" graph net, which performs N rounds of processing (message-passing)
       steps. The input to the Core is the concatenation of the Encoder's output
       and the previous output of the Core (labeled "Hidden(t)" below, where "t" is
@@ -111,8 +147,16 @@ class EncodeProcessDecode(snt.AbstractModule):
                  edge_output_size=None,
                  node_output_size=None,
                  global_output_size=None,
+                 init_graph = None,
                  name="EncodeProcessDecode"):
         super(EncodeProcessDecode, self).__init__(name=name)
+        self.init_graph = get_empty_graph(nodeshape=init_graph.nodes.shape,
+                                          edgeshape=init_graph.edges.shape,
+                                          glblshape=init_graph.globals.shape,
+                                          senders=init_graph.senders,
+                                          receivers=init_graph.receivers
+                                         )
+        self._geomlp = GeoMLP(self.init_graph)
         self._encoder = MLPGraphIndependent()
         self._core = MLPGraphNetwork()
         self._decoder = MLPGraphIndependent()
@@ -130,11 +174,18 @@ class EncodeProcessDecode(snt.AbstractModule):
                 modules.GraphIndependent(edge_fn, node_fn)
 
     def _build(self, input_op, num_processing_steps):
-        latent = self._encoder(input_op)
+        geo_out = self._geomlp(input_op)
+        print("\nGEO OUT")
+        print(geo_out)
+        latent = self._encoder(geo_out)
+        print("\nLatent0")
+        print(latent)
         latent0 = latent
         output_ops = []
         for _ in range(num_processing_steps):
             core_input = utils_tf.concat([latent0, latent], axis=1)
+            print("\nCORE INP")
+            print(core_input)
             latent = self._core(core_input)
             decoded_op = self._decoder(latent)
             output_ops.append(self._output_transform(decoded_op))
@@ -153,7 +204,7 @@ class timecrement(snt.Module):
         self.disable = disable
     def __call__(self,T):
         if self.disable:
-            return T[:,:2]
+            return T
         day = T[0,0]
         tg = T[0,1]
         self.T = tf.mod(tf.add(T,self.add_tg),tf.constant([[8.,self.ntg]],dtype=np.double))
@@ -191,27 +242,33 @@ def draw_graph(graph, node_pos_dict, col_lims=None):
             arrowsize=10)
     return fig,ax
 
-def snap2graph(h5file,day,tg,use_tf=False,placeholder=False,name=None):
+def snap2graph(h5file,day,tg,use_tf=False,placeholder=False,name=None,normalize=True):
     snapstr = 'day'+str(day)+'tg'+str(tg)
     glbls = h5file['glbl_features/'+snapstr][0] # Seems glbls have extra dimension
     nodes = h5file['node_features/'+snapstr]
     edges = h5file['edge_features/'+snapstr]
     senders = h5file['senders']
     receivers = h5file['receivers']
-
-#     node_arr = np.subtract(nodes[:],node_mus)
-#     node_arr = np.divide(node_arr,node_std)
-#     edge_arr = np.subtract(edges[:],edge_mus)
-#     edge_arr = np.divide(edge_arr,edge_std)
+    
+    node_arr = nodes[:]
+    edge_arr = edges[:]
+    glbl_arr = glbls[:]
+    
+    if normalize:
+        node_norms = h5file.attrs['node_norms'][:]
+        edge_norms = h5file.attrs['edge_norms'][:]
+        node_arr = mynorm(node_arr,node_norms[0,:],node_norms[1,:])
+        edge_arr = mynorm(edge_arr,edge_norms[0,:],edge_norms[1,:])
+        glbl_arr = np.divide(glbl_arr,[6.,NTG-1])
 
     graphdat_dict = {
-        "globals": glbls[:].astype(np.float),
-        "nodes": nodes[:].astype(np.float),
-        "edges": edges[:].astype(np.float),
+        "globals": glbl_arr.astype(np.float),
+        "nodes": node_arr.astype(np.float),
+        "edges": edge_arr.astype(np.float),
         "senders": senders[:],
         "receivers": receivers[:],
-        "n_node": nodes.shape[0],
-        "n_edge": edges.shape[0]
+        "n_node": node_arr.shape[0],
+        "n_edge": edge_arr.shape[0]
     }
 
     if not use_tf:
@@ -226,6 +283,48 @@ def snap2graph(h5file,day,tg,use_tf=False,placeholder=False,name=None):
             
     return graphs_tuple
 
+def mynorm(nparr,mus,stds):
+    return np.divide(np.subtract(nparr,mus),stds)
+
+def my_unnorm(nparr,norms):
+    return np.add(np.multiply(nparr,norms[1,:]),norms[0,:])
+
+def unnorm_graph(graph, node_norms, edge_norms):
+    return graph.replace(nodes=my_unnorm(graph.nodes,node_norms),
+                         edges=my_unnorm(graph.edges,edge_norms))
+                                         
+
+def get_norm_stats(h5_name):
+    # Iterate over nodes and edges of h5f file to
+    # Get the mus, sigmas of the dataset
+    h5f = h5py.File(h5_name,'r')
+    nodegroup = h5f['node_features']
+    edgegroup = h5f['edge_features']
+    
+    # _stats hold the mu and sigma for each feature
+    node_stats, edge_stats = np.zeros((2,3),dtype=np.double),\
+                             np.zeros((2,6),dtype=np.double)
+    k = 1 # data iter
+    for key,dset in progressbar(nodegroup.items()):
+        for row in dset:
+            m_k = node_stats[0,:] + (row - node_stats[0,:])/k
+            node_stats[1,:] = node_stats[1,:] + (row - node_stats[0,:])*(row - m_k)
+            node_stats[0,:] = m_k
+            k+=1
+    node_stats[1,:] = np.sqrt(node_stats[1,:]/(k-1))
+    
+    k = 1
+    for key,dset in progressbar(edgegroup.items()):
+        for row in dset:
+            m_k = edge_stats[0,:] + (row - edge_stats[0,:])/k
+            edge_stats[1,:] = edge_stats[1,:] + (row - edge_stats[0,:])*(row - m_k)
+            edge_stats[0,:] = m_k
+            k+=1
+    edge_stats[1,:] = np.sqrt(edge_stats[1,:]/(k-1))
+    h5f.close()
+    
+    return node_stats, edge_stats
+    
 def copy_graph(graphs_tuple):
     return utils_np.data_dicts_to_graphs_tuple(
         utils_np.graphs_tuple_to_data_dicts(graphs_tuple))
