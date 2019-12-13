@@ -1,3 +1,5 @@
+*.swp
+*.swo
 toys/
 nn_inputs/
 papers/
@@ -11,3 +13,4 @@ tmp.py
 graphsnapper.ipynb
 graphsnapper_mpi.py
 graphtools_mpi.py
+images_tmp/
