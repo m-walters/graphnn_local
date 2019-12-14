@@ -26,7 +26,8 @@ twopi = np.pi*2
 # Defaults for below were 2 and 16
 NUM_LAYERS = 2  # Hard-code number of layers in the edge/node/global models.
 LATENT_SIZE = 16  # Hard-code latent layer sizes for demos.
-NTG = 144
+DTG = 0.5
+NTG = int(60*24/DTG)
 
 def make_mlp_model(Lsize=LATENT_SIZE,Nlayer=NUM_LAYERS):
   """Instantiates a new MLP, followed by LayerNorm.
@@ -305,7 +306,7 @@ def EdgeNodeCovariance(h5_name):
 
     t = 0
     for day in range(7):
-        for tg in progressbar(range(NTG)):
+        for tg in progressbar(range(1)):
             tg_post = (tg+1)%NTG
             day_post = day
             if tg == (NTG-1):
@@ -330,6 +331,45 @@ def EdgeNodeCovariance(h5_name):
 
     h5f.close()
 
+def CalcMFactor(h5_name):
+    h5f = h5py.File(h5_name,'a')
+    senders = h5f['senders'][:]
+    receivers = h5f['receivers'][:]
+    n_node = h5f.attrs['n_nodes']
+    M_np = np.zeros((n_node),dtype=np.float)
+
+    k = 1
+    for day in range(7):
+        for tg in progressbar(range(NTG)):
+            tg_post = (tg+1)%NTG
+            day_post = day
+            if tg == (NTG-1):
+                day_post = (day+1)%7
+            nodes_post = h5f['node_features/day'+str(day_post)+'tg'+str(tg_post)]
+            edges = h5f['edge_features/day'+str(day)+'tg'+str(tg)]
+
+            for i,node in enumerate(nodes_post):
+                i_sends = senders[receivers==i]
+                ncar_e = 0
+                for sender in i_sends:
+                    j = list(set(np.where(senders==sender)[0]) & set(np.where(receivers==i)[0]))
+                    assert len(j)==1
+                    j_edge = edges[j[0]]
+                    ncar_e += j_edge[0]
+                diff = node[0] - ncar_e
+                M_np[i] = M_np[i] + (diff - M_np[i])/k
+                k+=1
+
+    try:
+        h5f.create_dataset('M',data=M_np)
+    except:
+        del h5f['M']
+        h5f.create_dataset('M',data=M_np)
+
+    return
+
+
+
     
 def create_nn_inputset(h5_name):
     h5f = h5py.File(h5_name,'a')
@@ -342,24 +382,39 @@ def create_nn_inputset(h5_name):
         return
 
     try:
-        grp = h5f.create_group("nn_edge_features")
+        edgegrp = h5f.create_group("nn_edge_features")
     except:
         print("nn_edge_features group already exists. Overwriting")
         del h5f['nn_edge_features']
-        grp = h5f.create_group("nn_edge_features")
+        edgegrp = h5f.create_group("nn_edge_features")
 
-    ogshape = h5f['edge_features/day0tg0'].shape
+    try:
+        nodegrp = h5f.create_group("nn_node_features")
+    except:
+        print("nn_node_features group already exists. Overwriting")
+        del h5f['nn_node_features']
+        nodegrp = h5f.create_group("nn_node_features")
+
+    n_edge = h5f.attrs['n_edges']
+    n_node = h5f.attrs['n_nodes']
     for d in progressbar(range(7)):
         for tg in range(NTG):
-            newfts = np.zeros((ogshape[0],10),dtype=np.float64)
             snapstr = "day"+str(d)+"tg"+str(tg)
+            e_fts = np.zeros((n_edge,13),dtype=np.float64)
             edges = h5f['edge_features/'+snapstr]
-            newfts[:,:3] = edges[:]
-            newfts[:,3:6] = covs[:]
-            newfts[:,6:9] = covs[:]*edges[:]
-            newfts[:,9] = edges[:,0]*edges[:,1]
+            e_fts[:,:4] = edges[:]
+            e_fts[:,4:7] = covs[:]
+            e_fts[:,7:10] = covs[:]*edges[:,:3]
+            e_fts[:,10] = edges[:,0]*edges[:,1]
+            e_fts[:,11] = (DTG/60.)*edges[:,1]/edges[:,3]
+            e_fts[:,12] = e_fts[:,11] * edges[:,0]
 
-            grp.create_dataset(snapstr,data=newfts)
+            n_fts = np.zeros((n_node,5),dtype=np.float64)
+            nodes = h5f['node_features/'+snapstr]
+            n_fts[:,3] = nodes[:]
+            #n_fts[:
+
+            edgegrp.create_dataset(snapstr,data=e_fts)
 
     print("Creating normalized dataset")
     try:
@@ -441,7 +496,7 @@ def get_norm_stats(h5_name):
     h5f = h5py.File(h5_name,'r')
     nodegroup = h5f['nn_node_features']
     edgegroup = h5f['nn_edge_features']
-    nedge, nnode = h5f['n_edges'], h5f['n_nodes']
+    nedge, nnode = h5f.attrs['n_edges'], h5f.attrs['n_nodes']
     
     # _stats hold the mu and sigma for each feature
     nodeshape = nodegroup['day0tg0'].shape
