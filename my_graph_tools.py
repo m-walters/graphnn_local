@@ -249,13 +249,13 @@ def draw_graph(graph, node_pos_dict, col_lims=None, is_normed=False, normfile=No
 def snap2graph(h5file,day,tg,use_tf=False,placeholder=False,name=None,normalize=True):
     snapstr = 'day'+str(day)+'tg'+str(tg)
     if normalize:
-        glbls = h5file['nn_glbl_features_normed/'+snapstr]
-        edges = h5file['nn_edge_features_normed/'+snapstr]
-        nodes = h5file['nn_node_features_normed/'+snapstr]
+        edges = h5file['nn_edge_features/'+snapstr]
+        nodes = h5file['nn_node_features/'+snapstr]
+        glbls = h5file['nn_glbl_features/'+snapstr]
     else:
-        glbls = h5file['glbl_features/'+snapstr]
         edges = h5file['nn_edge_features/'+snapstr]
         nodes = h5file['node_features/'+snapstr]
+        glbls = h5file['glbl_features/'+snapstr]
     senders = h5file['senders']
     receivers = h5file['receivers']
     
@@ -295,7 +295,8 @@ def EdgeNodeCovariance(h5_name):
     senders = h5f['senders']
     receivers = h5f['receivers']
     nedge = senders.shape[0]
-    h5_cov = h5f.create_dataset("edge_node_covs",shape=(nedge,3),dtype=np.double)
+    h5_cov = h5f.create_dataset("edge_node_covs",compression="gzip",
+                                compression_opts=6,shape=(nedge,3),dtype=np.double)
     
     # Iterate over senders and edges
     # Note that these arrays have corresponding indices
@@ -306,15 +307,16 @@ def EdgeNodeCovariance(h5_name):
 
     t = 0
     for day in range(7):
-        for tg in progressbar(range(1)):
+        for tg in progressbar(range(0,NTG)):
             tg_post = (tg+1)%NTG
             day_post = day
             if tg == (NTG-1):
                 day_post = (day+1)%7
             edges = h5f['edge_features/day'+str(day)+'tg'+str(tg)]
+            send_idxs = np.argwhere(edges[:,0] > 0).flatten()
             nodes_post = h5f['node_features/day'+str(day_post)+'tg'+str(tg_post)]
 
-            for i in range(nedge):
+            for i in send_idxs:
                 s,r = senders[i], receivers[i]
                 edge = edges[i]
                 x = edge[:3]
@@ -325,8 +327,11 @@ def EdgeNodeCovariance(h5_name):
 
     for i in range(nedge):
         covs = []
+        # np_dat is mostly zeros that we want to ignore
+        dat = np_dat[i, np_dat[i,:,0,0]>0]
+        if dat.shape[0] < 2: continue
         for j in range(3):
-            covs.append(np.cov(np_dat[i,:,:,j],rowvar=False)[0,1])
+            covs.append(np.cov(dat[:,:,j],rowvar=False)[0,1])
         h5_cov[i] = covs
 
     h5f.close()
@@ -337,8 +342,13 @@ def CalcMFactor(h5_name):
     receivers = h5f['receivers'][:]
     n_node = h5f.attrs['n_nodes']
     M_np = np.zeros((n_node),dtype=np.float)
+    ks = np.ones((n_node),dtype=np.float)
 
-    k = 1
+    # Create lookup table of senders for each node
+    send_edges = {}
+    for i in range(n_node):
+        send_edges.update({i: np.argwhere(receivers==i).flatten()})
+
     for day in range(7):
         for tg in progressbar(range(NTG)):
             tg_post = (tg+1)%NTG
@@ -348,26 +358,30 @@ def CalcMFactor(h5_name):
             nodes_post = h5f['node_features/day'+str(day_post)+'tg'+str(tg_post)]
             edges = h5f['edge_features/day'+str(day)+'tg'+str(tg)]
 
-            for i,node in enumerate(nodes_post):
-                i_sends = senders[receivers==i]
+            ncars_n = nodes_post[:,0]
+            ncars_e = edges[:,0]
+            for i in range(n_node):
                 ncar_e = 0
-                for sender in i_sends:
-                    j = list(set(np.where(senders==sender)[0]) & set(np.where(receivers==i)[0]))
-                    assert len(j)==1
-                    j_edge = edges[j[0]]
-                    ncar_e += j_edge[0]
-                diff = node[0] - ncar_e
-                M_np[i] = M_np[i] + (diff - M_np[i])/k
-                k+=1
+                for i_send in send_edges[i]:
+                    #j = list(set(np.where(senders==sender)[0]) & set(np.where(receivers==i)[0]))
+                    #assert len(j)==1
+                    #ncar_e += int(j_edge[0])
+                    ncar_e += ncars_e[i_send]
+
+                if (ncar_e==0) and (ncars_n[i]==0):
+                    # Nothing happening, skip this data
+                    continue
+                diff = ncars_n[0] - ncar_e
+                M_np[i] = M_np[i] + (diff - M_np[i])/ks[i]
+                ks[i] += 1
 
     try:
-        h5f.create_dataset('M',data=M_np)
+        h5f.create_dataset('M',data=M_np,compression="gzip",compression_opts=6)
     except:
         del h5f['M']
-        h5f.create_dataset('M',data=M_np)
+        h5f.create_dataset('M',data=M_np,compression="gzip",compression_opts=6)
 
     return
-
 
 
     
@@ -382,18 +396,35 @@ def create_nn_inputset(h5_name):
         return
 
     try:
-        edgegrp = h5f.create_group("nn_edge_features")
+        M = h5f['M']
+    except:
+        print("M factor dataset DNE, exiting.")
+        h5f.close()
+        return
+
+    try:
+        nn_edgegroup = h5f.create_group("nn_edge_features")
     except:
         print("nn_edge_features group already exists. Overwriting")
         del h5f['nn_edge_features']
-        edgegrp = h5f.create_group("nn_edge_features")
-
+        nn_edgegroup = h5f.create_group("nn_edge_features")
     try:
-        nodegrp = h5f.create_group("nn_node_features")
+        nn_nodegroup = h5f.create_group("nn_node_features")
     except:
         print("nn_node_features group already exists. Overwriting")
         del h5f['nn_node_features']
-        nodegrp = h5f.create_group("nn_node_features")
+        nn_nodegroup = h5f.create_group("nn_node_features")
+    try:
+        nn_glblgroup = h5f.create_group("nn_glbl_features")
+    except:
+        print("nn_glbl_features group already exists. Overwriting")
+        del h5f['nn_glbl_features']
+        nn_glblgroup = h5f.create_group("nn_glbl_features")
+
+    node_stats = np.zeros((2,4),dtype=np.float64)
+    edge_stats = np.zeros((2,13),dtype=np.float64)
+    glbl_stats = np.zeros((2,2),dtype=np.float64)
+    nk, ek = 1, 1
 
     n_edge = h5f.attrs['n_edges']
     n_node = h5f.attrs['n_nodes']
@@ -409,14 +440,38 @@ def create_nn_inputset(h5_name):
             e_fts[:,11] = (DTG/60.)*edges[:,1]/edges[:,3]
             e_fts[:,12] = e_fts[:,11] * edges[:,0]
 
-            n_fts = np.zeros((n_node,5),dtype=np.float64)
+            n_fts = np.zeros((n_node,4),dtype=np.float64)
             nodes = h5f['node_features/'+snapstr]
-            n_fts[:,3] = nodes[:]
-            #n_fts[:
+            n_fts[:,:3] = nodes[:]
+            n_fts[:,3] = M[:]
 
-            edgegrp.create_dataset(snapstr,data=e_fts)
+            # You could do some stat stuff here
+            np.random.shuffle(e_fts)
+            np.random.shuffle(n_fts)
+            for e_ft in e_fts[:50]:
+                m_k = edge_stats[0,:] + (e_ft - edge_stats[0,:])/ek
+                edge_stats[1,:] = edge_stats[1,:] + (e_ft - edge_stats[0,:])*(e_ft - m_k)
+                edge_stats[0,:] = m_k
+                ek+=1
+            for n_ft in n_fts[:20]:
+                m_k = node_stats[0,:] + (n_ft - node_stats[0,:])/nk
+                node_stats[1,:] = node_stats[1,:] + (n_ft - node_stats[0,:])*(n_ft - m_k)
+                node_stats[0,:] = m_k
+                nk+=1
+
+            nn_edgegroup.create_dataset(snapstr,data=e_fts,compression="gzip",compression_opts=6)
+            nn_nodegroup.create_dataset(snapstr,data=n_fts,compression='gzip',compression_opts=6)
 
     print("Creating normalized dataset")
+
+    #
+    #
+    # Lets not have separate datasets for the unnormed and normed features
+    # Just overwrite the unnormed stuff with the normed stuff
+    #
+    #
+
+
     try:
         normed_edge_group = h5f.create_group("nn_edge_features_normed")
         normed_node_group = h5f.create_group("nn_node_features_normed")
@@ -429,17 +484,26 @@ def create_nn_inputset(h5_name):
         normed_node_group = h5f.create_group("nn_node_features_normed")
         normed_glbl_group = h5f.create_group("nn_glbl_features_normed")
 
-    node_stats = np.zeros((2,3),dtype=np.float64)
-    edge_stats = np.zeros((2,10),dtype=np.float64)
+    """
+    print("Calculating norm stats")
+    node_stats = np.zeros((2,4),dtype=np.float64)
+    edge_stats = np.zeros((2,13),dtype=np.float64)
     glbl_stats = np.zeros((2,2),dtype=np.float64)
-    nodegroup = h5f['node_features']
-    edgegroup = h5f['nn_edge_features']
     glblgroup = h5f['glbl_features']
 
-    print("Calculating norm stats")
+    # This loop goes over each tg and then each
+    # edge or node within the tg
+    # This is costly, let's do Sun,Mon,Thur,Sat
+    # and some random selection of 25% of the nodes/edges
+    # ...later
+    #
+    # You could also in theory gather stats as you build the
+    # nn_nodegroup.items in the above loops
+    #
     k = 1 # data iter
-    for key,dset in progressbar(nodegroup.items()):
-        for row in dset:
+    for key,dset in progressbar(nn_nodegroup.items()):
+        np.random.shuffle(dset)
+        for row in dset[:10]:
             m_k = node_stats[0,:] + (row - node_stats[0,:])/k
             node_stats[1,:] = node_stats[1,:] + (row - node_stats[0,:])*(row - m_k)
             node_stats[0,:] = m_k
@@ -447,35 +511,55 @@ def create_nn_inputset(h5_name):
     node_stats[1,:] = np.sqrt(node_stats[1,:]/(k-1))
     
     k = 1
-    for key,dset in progressbar(edgegroup.items()):
-        for row in dset:
+    for key,dset in progressbar(nn_edgegroup.items()):
+        np.random.shuffle(dset)
+        for row in dset[:10]:
             m_k = edge_stats[0,:] + (row - edge_stats[0,:])/k
             edge_stats[1,:] = edge_stats[1,:] + (row - edge_stats[0,:])*(row - m_k)
             edge_stats[0,:] = m_k
             k+=1
     edge_stats[1,:] = np.sqrt(edge_stats[1,:]/(k-1))
+    """
 
+    node_stats[1,:] = np.sqrt(node_stats[1,:]/(nk-1))
+    edge_stats[1,:] = np.sqrt(edge_stats[1,:]/(ek-1))
     glbl_stats[:] = [[3.0,2.0], [np.mean(range(NTG)),np.std(range(NTG))]]
 
+    glblgroup = h5f['glbl_features']
     # Now that we have the norm stats, we apply it to the existing datasets
     print("Applying norm to feature sets")
     for d in progressbar(range(7)):
         for tg in range(NTG):
             snapstr="day"+str(d)+"tg"+str(tg)
-            nodes = nodegroup[snapstr]
-            edges = edgegroup[snapstr]
+            nodes = nn_nodegroup[snapstr]
+            edges = nn_edgegroup[snapstr]
             glbls = glblgroup[snapstr]
             normed_nodes = mynorm(nodes,node_stats[0,:],node_stats[1,:])
             normed_edges = mynorm(edges,edge_stats[0,:],edge_stats[1,:])
             normed_glbls = mynorm(glbls,glbl_stats[0,:],glbl_stats[1,:])
-            normed_node_group.create_dataset(snapstr,data=normed_nodes)
-            normed_edge_group.create_dataset(snapstr,data=normed_edges)
-            normed_glbl_group.create_dataset(snapstr,data=normed_glbls)
+
+            if 0:
+                normed_node_group.create_dataset(snapstr,compression="gzip",compression_opts=6,
+                                                 data=normed_nodes)
+                normed_edge_group.create_dataset(snapstr,compression="gzip",compression_opts=6,
+                                                 data=normed_edges)
+                normed_glbl_group.create_dataset(snapstr,compression="gzip",compression_opts=6,
+                                                 data=normed_glbls)
+            else:
+                nodes[:] = normed_nodes.copy()
+                edges[:] = normed_edges.copy()
+                nn_glblgroup.create_dataset(snapstr,data=normed_glbls,compression='gzip',compression_opts=6)
 
     # Save the stats to hdf5
-    h5f.create_dataset('node_stats',data=node_stats)
-    h5f.create_dataset('edge_stats',data=edge_stats)
-    h5f.create_dataset('glbl_stats',data=glbl_stats)
+    try:
+        h5f.create_dataset('node_stats',compression="gzip",compression_opts=6,data=node_stats)
+        h5f.create_dataset('edge_stats',compression="gzip",compression_opts=6,data=edge_stats)
+        h5f.create_dataset('glbl_stats',compression="gzip",compression_opts=6,data=glbl_stats)
+    except:
+        del h5f['node_stats'], h5f['edge_stats'], h5f['glbl_stats']
+        h5f.create_dataset('node_stats',compression="gzip",compression_opts=6,data=node_stats)
+        h5f.create_dataset('edge_stats',compression="gzip",compression_opts=6,data=edge_stats)
+        h5f.create_dataset('glbl_stats',compression="gzip",compression_opts=6,data=glbl_stats)
 
     h5f.close()
 
@@ -490,39 +574,6 @@ def unnorm_graph(graph, node_norms, edge_norms):
     return graph.replace(nodes=my_unnorm(graph.nodes,node_norms),
                          edges=my_unnorm(graph.edges,edge_norms))
                                          
-def get_norm_stats(h5_name):
-    # Iterate over nodes and edges of h5f file to
-    # Get the mus, sigmas of the dataset
-    h5f = h5py.File(h5_name,'r')
-    nodegroup = h5f['nn_node_features']
-    edgegroup = h5f['nn_edge_features']
-    nedge, nnode = h5f.attrs['n_edges'], h5f.attrs['n_nodes']
-    
-    # _stats hold the mu and sigma for each feature
-    nodeshape = nodegroup['day0tg0'].shape
-    edgeshape = edgegroup['day0tg0'].shape
-    node_stats, edge_stats = np.zeros((2,nodeshape[1]),dtype=np.double),\
-                             np.zeros((2,edgeshape[1]),dtype=np.double)
-    k = 1 # data iter
-    for key,dset in progressbar(nodegroup.items()):
-        for row in dset:
-            m_k = node_stats[0,:] + (row - node_stats[0,:])/k
-            node_stats[1,:] = node_stats[1,:] + (row - node_stats[0,:])*(row - m_k)
-            node_stats[0,:] = m_k
-            k+=1
-    node_stats[1,:] = np.sqrt(node_stats[1,:]/(k-1))
-    
-    k = 1
-    for key,dset in progressbar(edgegroup.items()):
-        for row in dset:
-            m_k = edge_stats[0,:] + (row - edge_stats[0,:])/k
-            edge_stats[1,:] = edge_stats[1,:] + (row - edge_stats[0,:])*(row - m_k)
-            edge_stats[0,:] = m_k
-            k+=1
-    edge_stats[1,:] = np.sqrt(edge_stats[1,:]/(k-1))
-    h5f.close()
-    
-    return node_stats, edge_stats
     
 def copy_graph(graphs_tuple):
     return utils_np.data_dicts_to_graphs_tuple(
@@ -539,12 +590,12 @@ def get_daytimes():
     return daytimes
     
 
-def get_norm_stats_2(hfname):
+def get_norm_stats(hfname):
     h5f = h5py.File(hfname,'a')
-    node_stats = np.zeros((2,3),dtype=np.float64)
-    edge_stats = np.zeros((2,10),dtype=np.float64)
+    node_stats = np.zeros((2,5),dtype=np.float64)
+    edge_stats = np.zeros((2,13),dtype=np.float64)
     glbl_stats = np.zeros((2,2),dtype=np.float64)
-    nodegroup = h5f['node_features']
+    nodegroup = h5f['nn_node_features']
     edgegroup = h5f['nn_edge_features']
     glblgroup = h5f['glbl_features']
 
@@ -574,12 +625,13 @@ def get_norm_stats_2(hfname):
         del h5f['node_stats'],h5f['edge_stats'],h5f['glbl_stats']
     except:
         pass
-    h5f.create_dataset('node_stats',data=node_stats)
-    h5f.create_dataset('edge_stats',data=edge_stats)
-    h5f.create_dataset('glbl_stats',data=glbl_stats)
+    h5f.create_dataset('node_stats',compression="gzip",compression_opts=6,data=node_stats)
+    h5f.create_dataset('edge_stats',compression="gzip",compression_opts=6,data=edge_stats)
+    h5f.create_dataset('glbl_stats',compression="gzip",compression_opts=6,data=glbl_stats)
 
     h5f.close()
 
+    return
 
 
 
